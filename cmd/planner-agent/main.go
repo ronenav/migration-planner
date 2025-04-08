@@ -5,8 +5,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math/rand"
 	"os"
 	"path"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/kubev2v/migration-planner/internal/agent"
@@ -23,7 +25,11 @@ const (
 
 func main() {
 	command := NewAgentCommand()
+	if command == nil {
+		os.Exit(1)
+	}
 	if err := command.Execute(); err != nil {
+		zap.S().Fatalf("Agent execution failed: %v", err)
 		os.Exit(1)
 	}
 }
@@ -31,17 +37,26 @@ func main() {
 type agentCmd struct {
 	config     *config.Config
 	configFile string
+	logger     *zap.Logger
+	logLevel   zap.AtomicLevel
 }
 
 func NewAgentCommand() *agentCmd {
-	logger := log.InitLog(zap.NewAtomicLevelAt(zapcore.InfoLevel))
-	defer func() { _ = logger.Sync() }()
+	defaultLogLevel := zapcore.InfoLevel
+	atomicLogLevel := zap.NewAtomicLevelAt(defaultLogLevel)
+
+	logger := log.InitLog(atomicLogLevel)
+	defer func() {
+		_ = logger.Sync()
+	}()
 
 	undo := zap.ReplaceGlobals(logger)
 	defer undo()
 
 	a := &agentCmd{
-		config: config.NewDefault(),
+		config:   config.NewDefault(),
+		logger:   logger,
+		logLevel: atomicLogLevel,
 	}
 
 	flag.StringVar(&a.configFile, "config", config.DefaultConfigFile, "Path to the agent's configuration file.")
@@ -55,26 +70,28 @@ func NewAgentCommand() *agentCmd {
 	flag.Parse()
 
 	if err := a.config.ParseConfigFile(a.configFile); err != nil {
-		zap.S().Fatalf("Error parsing config: %v", err)
+		zap.S().Fatalf("Error parsing config file '%s': %v", a.configFile, err)
+		return nil
 	}
 	if err := a.config.Validate(); err != nil {
 		zap.S().Fatalf("Error validating config: %v", err)
+		return nil
 	}
+
+	// --- TEMPORARY: Call simulation function ---
+	// Simulate 100 logs with 100ms delay (10 logs/second)
+	// Expect roughly 1 + (99 / 3) = 1 + 33 = 34 logs for "HTTP request completed"
+	go simulateHighVolumeLogs(logger, 100, 100*time.Millisecond)
+	zap.S().Infof("--- Finished high-volume log simulation ---")
+	// Using a goroutine so it doesn't block the main startup flow entirely
+	// Add a small sleep if needed to ensure some logs are generated before proceeding
+	time.Sleep(1 * time.Second) // Give simulation a moment to start spitting logs
 
 	return a
 }
 
 func (a *agentCmd) Execute() error {
-	logLvl, err := zap.ParseAtomicLevel(a.config.LogLevel)
-	if err != nil {
-		logLvl = zap.NewAtomicLevelAt(zapcore.InfoLevel)
-	}
-
-	logger := log.InitLog(logLvl)
-	defer func() { _ = logger.Sync() }()
-
-	undo := zap.ReplaceGlobals(logger)
-	defer undo()
+	zap.S().Info("Executing agent command...")
 
 	agentID, err := a.readFileFromPersistent(agentFilename)
 	if err != nil {
@@ -115,4 +132,42 @@ func (a *agentCmd) readFileFromVolatile(filename string) (string, error) {
 
 func (a *agentCmd) readFileFromPersistent(filename string) (string, error) {
 	return a.readFile(a.config.PersistentDataDir, filename)
+}
+
+func simulateHighVolumeLogs(logger *zap.Logger, count int, delay time.Duration) {
+	zap.S().Infof("--- Starting high-volume log simulation (%d logs, %v delay) ---", count, delay)
+
+	staticFields := []zap.Field{
+		zap.String("type", "http_request"),
+		zap.String("request_id", "SIMULATED"),
+		zap.String("http_method", "PUT"),
+		zap.String("http_path", "/api/v1/agents/SIMULATED/status"),
+		zap.String("http_proto", "HTTP/1.1"),
+		zap.String("remote_addr", "[::1]:99999"),
+		zap.Int("http_status_code", 200),
+		zap.String("http_status_text", "200 OK"),
+		zap.Int64("response_bytes", 0),
+		zap.String("user_agent", "SimulationClient/1.0"),
+	}
+
+	for i := 0; i < count; i++ {
+		simulatedLatency := time.Duration(rand.Intn(5)+1) * time.Millisecond // 1-5 ms
+		dynamicFields := append(staticFields, zap.Duration("latency", simulatedLatency))
+
+		var httpPath string
+		for _, field := range staticFields {
+			if field.Key == "http_path" {
+				httpPath = field.String
+				break
+			}
+		}
+
+		msg := fmt.Sprintf("******HTTP request completed for path: %s******", httpPath)
+		logger.Info(msg, dynamicFields...)
+
+		time.Sleep(delay)
+	}
+
+	zap.S().Infof("--- Finished high-volume log simulation ---")
+	_ = logger.Sync()
 }
